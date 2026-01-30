@@ -2,15 +2,16 @@ services:
   litellm:
     build:
       context: .
+      dockerfile: docker/Dockerfile.non_root
       args:
         target: runtime
     image: docker.litellm.ai/berriai/litellm:main-stable
     #########################################
-    ## Uncomment these lines to start proxy with a config.yaml file ##
-    # volumes:
-    #  - ./config.yaml:/app/config.yaml
-    # command:
-    #  - "--config=/app/config.yaml"
+    ## Uncomment these lines to start proxy with a proxy_config.yaml file ##
+    volumes:
+     - ./proxy_config.yaml:/app/config.yaml
+    command:
+     - "--config=/app/config.yaml"
     ##############################################
     ports:
       - "4000:4000" # Map the container port to the host, change the host port if necessary
@@ -48,6 +49,14 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
   prometheus:
     image: prom/prometheus
     volumes:
@@ -66,3 +75,5 @@ volumes:
     driver: local
   postgres_data:
     name: litellm_postgres_data # Named volume for Postgres data persistence
+  redis_data:
+    driver: local

@@ -1,0 +1,67 @@
+model_list:
+  # Gemini 3.0 Flash Preview
+  - model_name: gemini-3-flash
+    litellm_params:
+      model: gemini/gemini-3-flash-preview
+      api_key: os.environ/GEMINI_API_KEY
+    model_info:
+      mode: chat
+      supports_function_calling: true
+      supports_vision: true
+
+  # Gemini 2.5 Pro
+  - model_name: gemini-2.5-pro
+    litellm_params:
+      model: gemini/gemini-2.5-pro
+      api_key: os.environ/GEMINI_API_KEY
+    model_info:
+      mode: chat
+      supports_function_calling: true
+      supports_vision: true
+
+litellm_settings:
+  # 로깅 및 모니터링
+  success_callback: ["prometheus"]
+  failure_callback: ["prometheus"]
+  
+  # 상세 로깅
+  set_verbose: true
+  json_logs: true
+  
+  # 타임아웃 설정
+  request_timeout: 600
+  
+  # 재시도 설정
+  num_retries: 3
+  
+  # Rate Limiting (분당 요청 수)
+  max_parallel_requests: 100
+  
+  # 캐싱 설정 
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+    ttl: 3600
+  # Semantic 캐싱 (유사 질의 감지)
+  enable_semantic_cache: true
+  semantic_similarity_threshold: 0.95
+
+general_settings:
+  # 마스터 키 (관리자용)
+  master_key: os.environ/MASTER_KEY
+  
+  # 데이터베이스 연결
+  database_url: os.environ/DATABASE_URL
+  
+  # Admin UI 활성화
+  ui: true
+  
+  # 모델을 DB에 저장
+  store_model_in_db: true
+  store_prompts_in_spend_logs: true
+  
+  # 알림 설정 (선택사항)
+  # alerting: ["slack"]
+  # alerting_threshold: 100
