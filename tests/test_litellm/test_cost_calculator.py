@@ -1600,6 +1600,56 @@ def test_completion_cost_service_tier_priority():
     ), "Costs from params and usage should be similar (both flex)"
 
 
+def test_completion_cost_service_tier_for_bedrock():
+    """Test that Bedrock cost calculation applies service_tier-specific pricing."""
+    from litellm import completion_cost
+
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    model = "bedrock/us-east-1/test-bedrock-service-tier-cost-model"
+    litellm.register_model(
+        model_cost={
+            model: {
+                "input_cost_per_token": 0.001,
+                "output_cost_per_token": 0.002,
+                "input_cost_per_token_priority": 0.01,
+                "output_cost_per_token_priority": 0.02,
+                "input_cost_per_token_flex": 0.0005,
+                "output_cost_per_token_flex": 0.001,
+                "litellm_provider": "bedrock",
+                "max_tokens": 8192,
+            }
+        }
+    )
+
+    usage = Usage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
+    response = ModelResponse(usage=usage, model=model)
+
+    default_cost = completion_cost(
+        completion_response=response,
+        model=model,
+        custom_llm_provider="bedrock",
+    )
+
+    priority_cost = completion_cost(
+        completion_response=response,
+        model=model,
+        custom_llm_provider="bedrock",
+        optional_params={"service_tier": "priority"},
+    )
+
+    response_with_flex_tier = ModelResponse(usage=usage, model=model)
+    setattr(response_with_flex_tier, "service_tier", "flex")
+    flex_cost = completion_cost(
+        completion_response=response_with_flex_tier,
+        model=model,
+        custom_llm_provider="bedrock",
+    )
+
+    assert priority_cost > default_cost > flex_cost > 0
+
+
 def test_gemini_cache_tokens_details_no_negative_values():
     """
     Test for Issue #18750: Negative text_tokens with Gemini caching
@@ -1695,60 +1745,124 @@ def test_gemini_without_cache_tokens_details():
     print("✅ Gemini without cacheTokensDetails works correctly")
 
 
-def test_generic_provider_cached_token_cost():
+def test_gemini_implicit_caching_cost_calculation():
     """
-    Test that the generic cost calculator correctly handles cached tokens
-    for providers like z.ai/deepseek that are not explicitly handled.
-    """
-    from litellm.cost_calculator import completion_cost
-    from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
+    Test for Issue #16341: Gemini implicit cached tokens not counted in spend log
 
-    # Setup model cost for a generic provider
-    # We use a name that will bypass complex provider mapping logic
-    model_name = "custom-cached-model"
-    litellm.model_cost[model_name] = {
-        "input_cost_per_token": 0.0000006,
-        "output_cost_per_token": 0.0000006,
-        "cache_read_input_token_cost": 0.0000001,
-        "litellm_provider": "openai",
+    When Gemini uses implicit caching, it returns cachedContentTokenCount but NOT
+    cacheTokensDetails. In this case, we should subtract cachedContentTokenCount
+    from text_tokens to correctly calculate costs.
+
+    See: https://github.com/BerriAI/litellm/issues/16341
+    """
+    from litellm import completion_cost
+    from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
+        VertexGeminiConfig,
+    )
+    from litellm.types.utils import Choices, Message, ModelResponse
+
+    # Simulate Gemini response with implicit caching (cachedContentTokenCount only)
+    completion_response = {
+        "usageMetadata": {
+            "promptTokenCount": 10000,
+            "candidatesTokenCount": 5,
+            "totalTokenCount": 10005,
+            "cachedContentTokenCount": 8000,  # Implicit caching - no cacheTokensDetails
+            "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 10000}],
+            "candidatesTokensDetails": [{"modality": "TEXT", "tokenCount": 5}],
+        }
     }
 
-    # Case 1: Standard nested cached tokens (prompt_tokens_details.cached_tokens)
-    usage = Usage(
-        prompt_tokens=10000,
-        completion_tokens=0,
-        prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=9000),
+    usage = VertexGeminiConfig._calculate_usage(completion_response)
+
+    # Verify parsing
+    assert (
+        usage.cache_read_input_tokens == 8000
+    ), f"cache_read_input_tokens should be 8000, got {usage.cache_read_input_tokens}"
+    assert (
+        usage.prompt_tokens_details.cached_tokens == 8000
+    ), f"cached_tokens should be 8000, got {usage.prompt_tokens_details.cached_tokens}"
+
+    # CRITICAL: text_tokens should be (10000 - 8000) = 2000, NOT 10000
+    # This is the fix for issue #16341
+    assert (
+        usage.prompt_tokens_details.text_tokens == 2000
+    ), f"text_tokens should be 2000 (10000 - 8000), got {usage.prompt_tokens_details.text_tokens}"
+
+    # Verify cost calculation uses cached token pricing
+    response = ModelResponse(
+        id="mock-id",
+        model="gemini-2.0-flash",
+        choices=[
+            Choices(
+                index=0,
+                message=Message(role="assistant", content="Hello!"),
+                finish_reason="stop",
+            )
+        ],
+        usage=usage,
     )
-    response = ModelResponse(usage=usage, model=model_name)
 
     cost = completion_cost(
         completion_response=response,
-        model=model_name,
-        custom_llm_provider="openai",  # Explicitly set provider to trigger generic path
+        model="gemini-2.0-flash",
+        custom_llm_provider="gemini",
     )
 
-    # Expected: (1000 * 0.0000006) + (9000 * 0.0000001) = 0.0006 + 0.0009 = 0.0015
-    expected_cost = 0.0015
-    assert (
-        abs(cost - expected_cost) < 1e-9
-    ), f"Nested cache cost failed. Got {cost}, expected {expected_cost}"
+    # Get model pricing for verification
+    import litellm
 
-    # Case 2: Top-level cached tokens (cache_read_input_tokens)
-    usage_top = Usage(
-        prompt_tokens=10000,
-        completion_tokens=0,
-        cache_read_input_tokens=9000,
+    model_info = litellm.get_model_info("gemini/gemini-2.0-flash")
+    input_cost = model_info.get("input_cost_per_token", 0)
+    cache_read_cost = model_info.get("cache_read_input_token_cost", input_cost)
+    output_cost = model_info.get("output_cost_per_token", 0)
+
+    # Expected cost: (2000 * input) + (8000 * cache_read) + (5 * output)
+    expected_cost = (2000 * input_cost) + (8000 * cache_read_cost) + (5 * output_cost)
+
+    assert abs(cost - expected_cost) < 1e-9, (
+        f"Cost calculation is wrong. Got ${cost:.6f}, expected ${expected_cost:.6f}. "
+        f"Cached tokens may not be using reduced pricing."
     )
-    response_top = ModelResponse(usage=usage_top, model=model_name)
 
-    cost_top = completion_cost(
-        completion_response=response_top,
-        model=model_name,
+    print("✅ Issue #16341 fix verified: Gemini implicit caching cost calculated correctly")
+
+
+def test_additional_costs_only_for_azure_ai():
+    """
+    Test that _get_additional_costs is only called for azure_ai provider.
+
+    completion_cost() guards the call with `if custom_llm_provider == "azure_ai"`.
+    This test verifies that non-azure_ai providers get additional_costs=None
+    (reflected by the absence of "additional_costs" in cost_breakdown),
+    while azure_ai providers can include additional costs.
+    """
+    from litellm.cost_calculator import _get_additional_costs
+
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    # Non-azure_ai providers should return None
+    result = _get_additional_costs(
+        model="gpt-4o",
         custom_llm_provider="openai",
+        prompt_tokens=100,
+        completion_tokens=50,
     )
+    assert result is None, "Non-azure_ai providers should have no additional costs"
 
-    assert (
-        abs(cost_top - expected_cost) < 1e-9
-    ), f"Top-level cache cost failed. Got {cost_top}, expected {expected_cost}"
+    result = _get_additional_costs(
+        model="claude-sonnet-4-20250514",
+        custom_llm_provider="anthropic",
+        prompt_tokens=100,
+        completion_tokens=50,
+    )
+    assert result is None, "Anthropic should have no additional costs"
 
-    print("✅ Generic provider cached token cost verified")
+    result = _get_additional_costs(
+        model="gemini-2.0-flash",
+        custom_llm_provider="vertex_ai",
+        prompt_tokens=100,
+        completion_tokens=50,
+    )
+    assert result is None, "Vertex AI should have no additional costs"

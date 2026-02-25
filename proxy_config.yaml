@@ -18,6 +18,50 @@ model_list:
       mode: chat
       supports_function_calling: true
       supports_vision: true
+  
+  # Qwen3 8B 모델 
+  - model_name: qwen3:8b          # Ragflow에서 부를 이름
+    litellm_params:
+      model: openai/qwen3:8b      # LiteLLM이 Ollama로 전달할 모델명
+      api_base: http://10.50.7.154:11434/v1   # Ollama 주소
+      api_key: "ollama"             # Ollama는 키 불필요, 더미값 필수
+    model_info:
+      max_input_tokens: 40960          # Context length from ollama show
+      max_output_tokens: 8192          # Typical output limit for Qwen models
+      input_cost_per_token: 0.00000025    # $0.25 per 1M tokens
+      output_cost_per_token: 0.0000015      # $1.50 per 1M tokens
+      mode: chat
+      supports_function_calling: true     # Qwen3 supports tools
+
+  # Qwen3 14B 모델 
+  - model_name: qwen3:14b
+    litellm_params:
+      model: openai/qwen3:14b
+      api_base: http://10.50.7.154:11434/v1
+      api_key: "ollama"             # Ollama는 키 불필요, 더미값 필수
+    model_info:
+      max_input_tokens: 40960          # Context length from ollama show
+      max_output_tokens: 8192          # Typical output limit for Qwen models
+      input_cost_per_token: 0.00000025    # $0.25 per 1M tokens
+      output_cost_per_token: 0.0000015      # $1.50 per 1M tokens
+      mode: chat
+      supports_function_calling: true     # Qwen3 supports tools
+
+  # 임베딩 모델 (라우팅 판단용)
+#  - model_name: bge-m3-korean
+  - model_name: qwen3-embedding-4b
+    litellm_params:
+#      model: openai/bona/bge-m3-korean:latest
+      model: openai/qwen3-embedding:4b
+      api_base: http://10.50.7.154:11434/v1
+      api_key: "ollama"
+
+  # 내부: Ragflow RAG (OpenAI 호환 엔드포인트)
+  - model_name: ragflow-chat-ollama:8b
+    litellm_params:
+      model: ragflow/chat/c0ac6b0adaf011f091940242c0a81006/ollama:8b
+      api_base: os.environ/RAGFLOW_API_BASE
+      api_key: os.environ/RAGFLOW_API_KEY
 
 litellm_settings:
   # 로깅 및 모니터링
@@ -26,7 +70,7 @@ litellm_settings:
   
   # 상세 로깅
   set_verbose: true
-  json_logs: true
+  json_logs: false
   
   # 타임아웃 설정
   request_timeout: 600
@@ -38,15 +82,129 @@ litellm_settings:
   max_parallel_requests: 100
   
   # 캐싱 설정 
-  cache: true
+  cache: false
   cache_params:
     type: redis
     host: redis
     port: 6379
     ttl: 3600
+    max_connections: 100 # Increase as needed for your traffic
   # Semantic 캐싱 (유사 질의 감지)
   enable_semantic_cache: true
   semantic_similarity_threshold: 0.95
+
+  # LiteLLM Websearch Interception 설정
+  # - LLM: 로컬 Ollama (OpenAI 호환 모드)
+  # - Search: Naver Search Proxy (SearXNG 표준 엔드포인트)
+  #
+  # ※ enabled_providers에서 ollama는 미지원 → OpenAI 호환 라우트로 우회
+  #   model: openai/<model> + api_base: http://host:11434/v1 형태로 사용
+  callbacks:
+    - websearch_interception        # 반드시 문자열, dict 형식 불가
+    - ragflow_reference_callback.proxy_handler  # Ragflow reference → x-ragflow-reference 헤더로 노출
+  websearch_interception_params:    # 파라미터는 별도 키로 분리
+    enabled_providers:
+      - openai                      # openai 라우트를 사용하므로 openai로 지정
+    search_tool_name: "naver-search"
+
+search_tools:
+  - search_tool_name: "naver-search"
+    litellm_params:
+      search_provider: "searxng"
+      # Naver Search Proxy 서버 주소 (SearXNG 표준 엔드포인트)
+      # Docker 환경: http://naver-search-proxy:8001
+      # 로컬/직접 접근: http://10.50.1.192:8001
+      api_base: "http://10.50.1.192:8001"
+
+      # Provider-specific parameters (optional)
+      # categories: "general,news"  # SearXNG 카테고리 → 자동으로 Naver 카테고리에 매핑
+      # language: "ko"              # 언어 설정
+      # max_results: 10             # 결과 수 제한
+
+guardrails:
+  # ── [필수] Input Masking + Output Restoration ────────────────────────────────
+  # mode: pre_call  → LLM 호출 전 PII를 마스킹 토큰으로 교체
+  # output_parse_pii: true → LLM 응답의 마스킹 토큰을 원본 PII로 자동 복원
+  #
+  # 예시:
+  #   입력: "저는 홍길동이고 전화번호는 010-1234-5678입니다"
+  #   LLM수신: "저는 <KR_NAME_1>이고 전화번호는 <KR_PHONE_NUMBER_1>입니다"
+  #   LLM응답: "<KR_NAME_1>님의 전화번호 <KR_PHONE_NUMBER_1>을 확인했습니다"
+  #   사용자수신: "홍길동님의 전화번호 010-1234-5678을 확인했습니다"  ← 자동 복원
+  # ─────────────────────────────────────────────────────────────────────────────
+  - guardrail_name: "presidio-pii-ko-input"
+    litellm_params:
+      guardrail: presidio
+      mode: "pre_call"
+      output_parse_pii: true                # ← 핵심: LLM 응답 토큰 → 원본 복원
+
+      # Presidio 엔드포인트 (환경 변수로 주입)
+      # PRESIDIO_ANALYZER_API_BASE, PRESIDIO_ANONYMIZER_API_BASE (.env에서 설정)
+
+      presidio_language: "ko"
+
+      # 한국어 커스텀 인식기 (컨테이너 내 마운트 경로)
+      presidio_ad_hoc_recognizers: "/app/presidio/custom_recognizers.json"
+
+      # 신뢰도 임계값 (낮을수록 민감, 높을수록 정밀)
+      presidio_score_thresholds:
+        ALL: 0.5                    # 정의되지 않은 엔티티의 기본 임계값
+        KR_NAME: 0.85               # 이름 (맥락 없는 오탐 방지)
+        KR_SSN: 0.90                # 주민등록번호 (고위험)
+        KR_PHONE_NUMBER: 0.80       # 전화번호
+        KR_BANK_ACCOUNT: 0.65       # 계좌번호 (숫자 패턴 중복 가능성)
+        KR_EMAIL: 0.95              # 이메일
+        KR_BUSINESS_NUMBER: 0.85    # 사업자등록번호
+        KR_DRIVER_LICENSE: 0.85     # 운전면허번호
+        KR_PASSPORT: 0.90           # 여권번호 (고위험)
+        CREDIT_CARD: 0.85           # 신용카드
+        EMAIL_ADDRESS: 0.90         # 영문 이메일
+        PERSON: 0.70                # 영문 이름
+
+      # 감지 대상 엔티티 및 처리 방법
+      pii_entities_config:
+        # ── 표준 영어 엔티티 ──
+        CREDIT_CARD: "MASK"         # 신용카드 번호
+        EMAIL_ADDRESS: "MASK"       # 영문 이메일
+        PERSON: "MASK"              # 영문 이름
+        PHONE_NUMBER: "MASK"        # 영문 전화번호
+        # ── 한국어 커스텀 엔티티 ──
+        KR_NAME: "MASK"             # 한국 이름
+        KR_SSN: "MASK"              # 주민등록번호
+        KR_PHONE_NUMBER: "MASK"     # 한국 전화번호
+        KR_BANK_ACCOUNT: "MASK"     # 계좌번호
+        KR_EMAIL: "MASK"            # 이메일 (한국어 맥락)
+        KR_BUSINESS_NUMBER: "MASK"  # 사업자등록번호
+        KR_DRIVER_LICENSE: "MASK"   # 운전면허번호
+        KR_PASSPORT: "MASK"         # 여권번호
+
+  # ── [선택] Output PII Detection ───────────────────────────────────────────────
+  # LLM이 새로 생성한 고위험 PII(주민번호·카드번호 등)를 출력에서 차단
+  # output_parse_pii 복원 이후의 최종 응답에는 적용되지 않음
+  # (필요 없는 경우 이 guardrail 전체를 주석 처리)
+  # ─────────────────────────────────────────────────────────────────────────────
+  - guardrail_name: "presidio-pii-ko-output"
+    litellm_params:
+      guardrail: presidio
+      mode: "post_call"
+      presidio_language: "ko"
+      presidio_ad_hoc_recognizers: "/app/presidio/custom_recognizers.json"
+
+      presidio_score_thresholds:
+        KR_SSN: 0.90
+        KR_BANK_ACCOUNT: 0.75
+        CREDIT_CARD: 0.85
+
+      pii_entities_config:
+        CREDIT_CARD: "BLOCK"        # 신용카드 번호 출력 차단
+        KR_SSN: "BLOCK"             # 주민등록번호 출력 차단
+        KR_BANK_ACCOUNT: "MASK"     # 계좌번호 마스킹
+        KR_PHONE_NUMBER: "MASK"
+        KR_NAME: "MASK"
+        KR_EMAIL: "MASK"
+        KR_BUSINESS_NUMBER: "BLOCK" # 사업자번호 출력 차단
+        KR_DRIVER_LICENSE: "BLOCK"  # 면허번호 출력 차단
+        KR_PASSPORT: "BLOCK"        # 여권번호 출력 차단 (고위험)
 
 general_settings:
   # 마스터 키 (관리자용)
@@ -57,10 +215,15 @@ general_settings:
   
   # Admin UI 활성화
   ui: true
-  
+
   # 모델을 DB에 저장
   store_model_in_db: true
   store_prompts_in_spend_logs: true
+
+  # To prevent DB deadlocks with heavy traffic (1000+ requests per seconds)
+  # Traffic: spend update (key, user, team, etc)
+  # DB대신 redis queue에 write한 뒤 DB lock을 획득하면 redis queue을 DB에 flush함
+  use_redis_transaction_buffer: true
   
   # 알림 설정 (선택사항)
   # alerting: ["slack"]

@@ -2571,6 +2571,115 @@ async def test_gemini_context_caching_anthropic_format(sync_mode):
         # )
 
 
+@pytest.mark.parametrize(
+    "sync_mode",
+    [True, False],
+)
+@pytest.mark.asyncio
+async def test_gemini_context_caching_disabled_flag(sync_mode):
+    """
+    Test that disable_anthropic_gemini_context_caching_transform flag properly disables context caching.
+    
+    When the flag is set to True, messages with cache_control should not trigger caching API calls.
+    """
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
+
+    litellm.set_verbose = True
+    
+    # Store original value to restore later
+    original_flag_value = litellm.disable_anthropic_gemini_context_caching_transform
+    
+    try:
+        # Enable the disable flag
+        litellm.disable_anthropic_gemini_context_caching_transform = True
+        
+        gemini_context_caching_messages = [
+            # System Message with cache_control
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Here is the full text of a complex legal agreement {}".format(
+                            uuid.uuid4()
+                        )
+                        * 4000,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+            # User message with cache_control
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "What are the key terms and conditions in this agreement?",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "Certainly! the key terms and conditions are the following: the contract is 1 year long for $10/mo",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "What are the key terms and conditions in this agreement?",
+                    }
+                ],
+            },
+        ]
+        
+        if sync_mode:
+            client = HTTPHandler(concurrent_limit=1)
+        else:
+            client = AsyncHTTPHandler(concurrent_limit=1)
+            
+        with patch.object(client, "post", side_effect=mock_gemini_request) as mock_client:
+            try:
+                if sync_mode:
+                    response = litellm.completion(
+                        model="gemini/gemini-2.5-flash-lite-001",
+                        messages=gemini_context_caching_messages,
+                        temperature=0.2,
+                        max_tokens=10,
+                        client=client,
+                    )
+                else:
+                    response = await litellm.acompletion(
+                        model="gemini/gemini-2.5-flash-lite-001",
+                        messages=gemini_context_caching_messages,
+                        temperature=0.2,
+                        max_tokens=10,
+                        client=client,
+                    )
+
+            except Exception as e:
+                print(e)
+
+            # When caching is disabled, should only make 1 call (no separate cache creation call)
+            assert mock_client.call_count == 1, f"Expected 1 call when caching is disabled, got {mock_client.call_count}"
+
+            first_call_args = mock_client.call_args_list[0].kwargs
+            first_call_positional_args = mock_client.call_args_list[0].args
+
+            print(f"first_call_args with caching disabled: {first_call_args}")
+            print(f"first_call_positional_args with caching disabled: {first_call_positional_args}")
+
+            # Assert that cachedContents is NOT in the URL when caching is disabled
+            url = first_call_args.get("url", first_call_positional_args[0] if first_call_positional_args else "")
+            assert "cachedContents" not in url, "cachedContents should not be in URL when caching is disabled"
+            
+    finally:
+        # Restore original flag value
+        litellm.disable_anthropic_gemini_context_caching_transform = original_flag_value
+
+
+
 @pytest.mark.asyncio
 async def test_partner_models_httpx_ai21():
     litellm.set_verbose = True
@@ -3133,7 +3242,7 @@ def vertex_ai_anthropic_thinking_mock_response(*args, **kwargs):
         "id": "msg_vrtx_011pL6Np3MKxXL3R8theMRJW",
         "type": "message",
         "role": "assistant",
-        "model": "claude-3-7-sonnet-20250219",
+        "model": "claude-4-sonnet-20250514",
         "content": [
             {
                 "type": "thinking",
@@ -3605,6 +3714,60 @@ def test_vertex_schema_test():
     print(response)
 
 
+def test_gemini_nullable_object_tool_schema_httpx():
+    """
+    Ensure nullable object tool params preserve nested properties in Vertex schema conversion.
+    """
+    load_vertex_ai_credentials()
+    litellm._turn_on_debug()
+
+
+    tools = [{
+            "type": "function",
+            "strict": True,
+            "function": {
+                "name": "create_support_ticket",
+                "description": "Create a paid user support ticket",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["ticket_id", "customer_context"],
+                    "properties": {
+                        "ticket_id": {
+                            "type": "string",
+                            "description": "Unique identifier for the support ticket"
+                        },
+                        "customer_context": {
+                            "type": ["object", "null"],
+                            "description": "Context about the paid customer, if available",
+                            "additionalProperties": False,
+                            "required": ["user_id", "plan"],
+                            "properties": {
+                                "user_id": {
+                                    "type": "string",
+                                    "description": "Internal user identifier"
+                                },
+                                "plan": {
+                                    "type": "string",
+                                    "description": "Subscription plan name (e.g. pro, enterprise)"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+
+    response = litellm.completion(
+        model="vertex_ai/gemini-2.5-flash",
+        messages=[{"role": "user", "content": "call the tool"}],
+        tools=tools,
+        tool_choice="required",
+    )
+
+    print(response)
+
+
 def test_vertex_ai_response_id():
     """Test that litellm preserves the response ID from Vertex AI's API for non-streaming responses"""
     from litellm.llms.custom_httpx.http_handler import HTTPHandler
@@ -3708,50 +3871,100 @@ def test_vertex_ai_streaming_response_id():
 
 
 def test_vertex_ai_gemini_2_5_pro_streaming():
-    load_vertex_ai_credentials()
-    # litellm._turn_on_debug()
-    response = completion(
-        model="vertex_ai/gemini-2.5-pro",
-        messages=[{"role": "user", "content": "Hi!"}],
-        vertex_location="global",
-        stream=True,
-    )
-    has_real_content = False
-    for chunk in response:
-        print(chunk)
-        if (
-            chunk.choices[0].delta.content is not None
-            and len(chunk.choices[0].delta.content) > 0
-        ):
-            has_real_content = True
-    assert has_real_content
+    try:
+        load_vertex_ai_credentials()
+        # litellm._turn_on_debug()
+        response = completion(
+            model="vertex_ai/gemini-2.5-pro",
+            messages=[{"role": "user", "content": "Hi!"}],
+            vertex_location="global",
+            stream=True,
+        )
+        has_real_content = False
+        for chunk in response:
+            print(chunk)
+            if (
+                chunk.choices[0].delta.content is not None
+                and len(chunk.choices[0].delta.content) > 0
+            ):
+                has_real_content = True
+        assert has_real_content
+    except litellm.RateLimitError:
+        pytest.skip("Skipping due to rate limit error")
 
 
 def test_vertex_ai_gemini_audio_ogg():
-    load_vertex_ai_credentials()
-    litellm._turn_on_debug()
-    response = completion(
-        model="vertex_ai/gemini-2.0-flash",
-        messages=[
+    """
+    Test that OGG audio files are correctly formatted as file_data with audio/ogg mime type
+    in the request sent to Vertex AI. Uses mocked HTTP and auth to avoid flaky external
+    URL fetches and credential requirements.
+    """
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
+    from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "application/json"}
+    mock_response.json.return_value = {
+        "candidates": [
             {
-                "content": [
-                    {"text": "generate a transcript of the speech.", "type": "text"}
-                ],
-                "role": "user",
-            },
-            {
-                "content": [
-                    {
-                        "file": {
-                            "file_id": "https://upload.wikimedia.org/wikipedia/commons/5/5f/En-us-public.ogg"
-                        },
-                        "type": "file",
-                    }
-                ],
-                "role": "user",
-            },
+                "content": {
+                    "parts": [{"text": "public domain audio file"}],
+                    "role": "model",
+                },
+                "finishReason": "STOP",
+            }
         ],
-    )
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "totalTokenCount": 15,
+        },
+    }
+
+    client = HTTPHandler()
+    httpx_mock = MagicMock(return_value=mock_response)
+
+    with patch.object(client, "post", new=httpx_mock), patch.object(
+        VertexBase, "_ensure_access_token", return_value=("fake-token", "fake-project")
+    ):
+        response = completion(
+            model="vertex_ai/gemini-2.0-flash",
+            messages=[
+                {
+                    "content": [
+                        {"text": "generate a transcript of the speech.", "type": "text"}
+                    ],
+                    "role": "user",
+                },
+                {
+                    "content": [
+                        {
+                            "file": {
+                                "file_id": "https://upload.wikimedia.org/wikipedia/commons/5/5f/En-us-public.ogg"
+                            },
+                            "type": "file",
+                        }
+                    ],
+                    "role": "user",
+                },
+            ],
+            client=client,
+        )
+
+    httpx_mock.assert_called_once()
+    request_body = httpx_mock.call_args.kwargs["json"]
+    # Verify OGG file is sent as file_data with correct mime type
+    file_data_parts = [
+        part
+        for content in request_body["contents"]
+        for part in content["parts"]
+        if "file_data" in part
+    ]
+    assert len(file_data_parts) == 1, f"Expected 1 file_data part, got: {file_data_parts}"
+    file_data = file_data_parts[0]["file_data"]
+    assert file_data["mime_type"] == "audio/ogg", f"Expected audio/ogg, got: {file_data['mime_type']}"
+    assert "En-us-public.ogg" in file_data["file_uri"], f"Unexpected file_uri: {file_data['file_uri']}"
     print(response)
 
 

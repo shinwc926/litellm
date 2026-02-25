@@ -5,11 +5,17 @@ services:
       dockerfile: docker/Dockerfile.non_root
       args:
         target: runtime
-    image: docker.litellm.ai/berriai/litellm:main-stable
+    image: litellm/litellm-non_root:v1.81.6.rc.5
+#    image: docker.litellm.ai/berriai/litellm:main-stable
+
     #########################################
     ## Uncomment these lines to start proxy with a proxy_config.yaml file ##
     volumes:
      - ./proxy_config.yaml:/app/config.yaml
+#     - ./custom/custom_guardrail.py:/app/custom_guardrail.py
+#     - ./pii-shield/pii_shield_guardrail.py:/app/pii_shield_guardrail.py
+     - ./ragflow/ragflow_reference_callback.py:/app/ragflow_reference_callback.py
+     - ./presidio/custom_recognizers.json:/app/presidio/custom_recognizers.json
     command:
      - "--config=/app/config.yaml"
     ##############################################
